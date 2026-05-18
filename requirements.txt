@@ -1,4 +1,4 @@
-google-generativeai
+google-genai
 pdf2image
 Pillow
 python-dotenv
