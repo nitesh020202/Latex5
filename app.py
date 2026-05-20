@@ -19,13 +19,6 @@ CHECKPOINT_DIR = "checkpoints"
 
 
 def _safe_response_text(response) -> str | None:
-    """
-    Safely extract the model's actual reply text.
-    - Skips 'thought' parts (internal thinking tokens).
-    - Falls back to scanning parts if response.text is None.
-    - Prints finish_reason when response is truly empty.
-    """
-    # First try the fast path
     try:
         txt = response.text
         if txt is not None and txt.strip():
@@ -33,19 +26,17 @@ def _safe_response_text(response) -> str | None:
     except Exception:
         pass
 
-    # Scan parts, skipping thought (thinking) parts
     try:
         for cand in (response.candidates or []):
             for part in (cand.content.parts or []):
                 if getattr(part, "thought", False):
-                    continue          # skip internal thinking text
+                    continue
                 t = getattr(part, "text", None)
                 if t and t.strip():
                     return t
     except Exception:
         pass
 
-    # Debug: print why response is empty
     try:
         reason = response.candidates[0].finish_reason
         print(f"  [empty response] finish_reason={reason}")
@@ -55,7 +46,6 @@ def _safe_response_text(response) -> str | None:
 
 
 def _call_gemini(client, model_name: str, contents: list, cfg) -> str | None:
-    """Make one Gemini call and return clean text, or None on failure."""
     response = client.models.generate_content(
         model=model_name, contents=contents, config=cfg,
     )
@@ -63,20 +53,14 @@ def _call_gemini(client, model_name: str, contents: list, cfg) -> str | None:
 
 
 def _make_page_configs():
-    """
-    Build configs one-by-one so a single failure never kills the whole list.
-    Order: plain → json-mime → thinking (progressive budgets).
-    """
     cfgs = []
 
-    # 1. Plain — works on every model
     try:
         cfgs.append(genai_types.GenerateContentConfig(
             temperature=0, max_output_tokens=65536))
     except Exception as _e:
         print(f"[cfg] plain failed: {_e}")
 
-    # 2. JSON mime — clean output, no markdown
     try:
         cfgs.append(genai_types.GenerateContentConfig(
             temperature=0, max_output_tokens=65536,
@@ -84,7 +68,6 @@ def _make_page_configs():
     except Exception as _e:
         print(f"[cfg] json-mime failed: {_e}")
 
-    # 3-5. Thinking (skip if ThinkingConfig not supported)
     for budget in [1024, 8192, 24576]:
         try:
             cfgs.append(genai_types.GenerateContentConfig(
@@ -94,7 +77,6 @@ def _make_page_configs():
             print(f"[cfg] thinking budget={budget} failed: {_e}")
 
     if not cfgs:
-        # Ultimate fallback — bare minimum
         cfgs = [genai_types.GenerateContentConfig(
             temperature=0, max_output_tokens=65536)]
 
@@ -108,7 +90,6 @@ st.set_page_config(
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# ── Canonical field order ──
 FIELD_ORDER = [
     "questionid", "question", "option1", "option2", "option3", "option4",
     "Answer", "Explanation", "course", "subjectname", "chapter", "practice",
@@ -117,14 +98,18 @@ FIELD_ORDER = [
 ]
 
 # ================================================================
-# PyMuPDF PDF HELPERS (no Poppler needed)
+# PyMuPDF PDF HELPERS
 # ================================================================
 
-EXTRACTION_DPI = 350  # High DPI for clear math, fine lines, small text
+EXTRACTION_DPI = 350
 
 def pdf_page_to_png_bytes(pdf_path: str, page_num: int, dpi: int = EXTRACTION_DPI) -> bytes:
-    """Render PDF page to PNG with OpenCV enhancement for best OCR quality."""
-    doc  = fitz.open(pdf_path)
+    """Render PDF page to PNG. FIX: guard against out-of-range page_num."""
+    doc = fitz.open(pdf_path)
+    # ── FIX 1: guard page_num out of range ──
+    if page_num >= len(doc):
+        doc.close()
+        raise IndexError(f"Page index {page_num} out of range — document has {len(doc)} page(s)")
     page = doc[page_num]
     zoom = dpi / 72
     mat  = fitz.Matrix(zoom, zoom)
@@ -133,12 +118,9 @@ def pdf_page_to_png_bytes(pdf_path: str, page_num: int, dpi: int = EXTRACTION_DP
     try:
         import cv2, numpy as np
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        # Mild denoise — removes scan noise while keeping thin lines
         img = cv2.fastNlMeansDenoisingColored(img, None, 3, 3, 7, 21)
-        # Sharpen — makes LaTeX symbols and diagram edges crisper
         kernel = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]])
         img = cv2.filter2D(img, -1, kernel)
-        # CLAHE contrast normalisation — helps faint diagrams and light print
         lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
         l, a, b = cv2.split(lab)
         l = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8)).apply(l)
@@ -150,7 +132,6 @@ def pdf_page_to_png_bytes(pdf_path: str, page_num: int, dpi: int = EXTRACTION_DP
 
 
 def compute_template_image_hashes(pdf_path: str) -> set:
-    """Return MD5 hashes of images that appear on 3+ pages (logos, headers, template graphics)."""
     try:
         doc = fitz.open(pdf_path)
         hash_page_count: dict[str, int] = {}
@@ -174,7 +155,7 @@ def compute_template_image_hashes(pdf_path: str) -> set:
 
 
 # ================================================================
-# IMAGE EXTRACTION — RASTER + VECTOR (HANDLES ALL PDF IMAGE TYPES)
+# IMAGE EXTRACTION
 # ================================================================
 
 _IMG_FIELDS = ["question", "Explanation", "option1", "option2", "option3", "option4"]
@@ -189,17 +170,12 @@ _DIAGRAM_KWS = [
 
 def extract_page_embedded_images(pdf_path: str, page_num: int,
                                   skip_hashes: set | None = None) -> list[dict]:
-    """Extract ALL raster images from a PDF page.
-
-    Strategy:
-    • JPEG / PNG → use raw compressed bytes directly (keeps file small).
-    • CMYK JPEG / JPEG2000 / JBIG2 / CCITT → convert via Pixmap to RGB PNG.
-      (These formats cause black-screen in browsers if sent as raw bytes.)
-    • Uses get_images(full=True) + get_image_info(xrefs=True) to catch images
-      inside Form XObjects as well.
-    • Size threshold 50×40 px.
-    """
+    """FIX: guard page_num out of range."""
     doc = fitz.open(pdf_path)
+    # ── FIX 1 (also here): guard page_num ──
+    if page_num >= len(doc):
+        doc.close()
+        return []
     page = doc[page_num]
     seen_xrefs: set[int] = set()
 
@@ -216,7 +192,6 @@ def extract_page_embedded_images(pdf_path: str, page_num: int,
     except Exception:
         pass
 
-    # Build xref → y_pos map for top-to-bottom sorting
     xref_ypos: dict[int, float] = {}
     try:
         for info in page.get_image_info(hashes=False):
@@ -235,7 +210,7 @@ def extract_page_embedded_images(pdf_path: str, page_num: int,
             ext      = img_data.get("ext", "png").lower()
             w        = img_data.get("width",  0)
             h        = img_data.get("height", 0)
-            cs_n     = img_data.get("colorspace", 3)  # number of color components
+            cs_n     = img_data.get("colorspace", 3)
 
             if skip_hashes and hashlib.md5(raw).hexdigest() in skip_hashes:
                 continue
@@ -244,7 +219,6 @@ def extract_page_embedded_images(pdf_path: str, page_num: int,
             if _is_useless_image(raw):
                 continue
 
-            # Standard RGB JPEG or PNG → send compressed bytes as-is (small payload)
             if ext in ("jpg", "jpeg") and cs_n == 3:
                 mime = "image/jpeg"
                 b64  = base64.b64encode(raw).decode()
@@ -252,8 +226,6 @@ def extract_page_embedded_images(pdf_path: str, page_num: int,
                 mime = "image/png"
                 b64  = base64.b64encode(raw).decode()
             else:
-                # CMYK JPEG, JPEG2000, JBIG2, CCITT, indexed, etc.
-                # → decode via Pixmap and re-encode as RGB PNG
                 pix = fitz.Pixmap(doc, xref)
                 if pix.colorspace and pix.colorspace.n != 3:
                     pix = fitz.Pixmap(fitz.csRGB, pix)
@@ -277,11 +249,6 @@ def extract_page_embedded_images(pdf_path: str, page_num: int,
 
 
 def _is_useless_image(raw_bytes: bytes) -> bool:
-    """
-    Return True only for truly blank/solid images — NOT for line drawings.
-    A triangle (black lines on white) has ~95% white pixels but IS meaningful.
-    Only filter if < 1% of pixels are dark (near-blank) OR solid single colour.
-    """
     try:
         pix = fitz.Pixmap(raw_bytes)
         if pix.width < 10 or pix.height < 10:
@@ -296,16 +263,14 @@ def _is_useless_image(raw_bytes: bytes) -> bool:
             px = samples[i*n : i*n + min(3, n)]
             if len(px) >= 3:
                 brightness = (px[0] + px[1] + px[2]) / 3
-                if brightness < 180:   # counts as a meaningful dark pixel
+                if brightness < 180:
                     dark_count += 1
                 sampled += 1
         if sampled == 0:
             return False
         dark_ratio = dark_count / sampled
-        # Less than 0.5% dark pixels → blank/empty image → skip
         if dark_ratio < 0.005:
             return True
-        # Solid black fill (>98% very dark) → also useless
         if dark_ratio > 0.98:
             return True
         return False
@@ -314,12 +279,10 @@ def _is_useless_image(raw_bytes: bytes) -> bool:
 
 
 def _inflate_rect(r: fitz.Rect, d: float) -> fitz.Rect:
-    """Expand a Rect by d on all sides — works on all PyMuPDF versions."""
     return fitz.Rect(r.x0 - d, r.y0 - d, r.x1 + d, r.y1 + d)
 
 
 def _cluster_rects(rects: list, gap: int = 25) -> list:
-    """Merge rectangles that are within `gap` points of each other."""
     clusters: list[fitz.Rect] = []
     for rect in rects:
         expanded = _inflate_rect(rect, gap)
@@ -335,18 +298,12 @@ def _cluster_rects(rects: list, gap: int = 25) -> list:
 
 
 def extract_vector_diagram_regions(pdf_path: str, page_num: int) -> list[dict]:
-    """
-    Extract only REAL diagrams — triangles, graphs, circuits, physics/chemistry figures.
-    Conservative thresholds to avoid capturing text lines, underlines, borders.
-
-    Rules:
-    - Minimum 60×60 pt AND area > 6000 sq pt (real diagrams are always substantial)
-    - Must have COMPLEX structure: at least 4 distinct path elements in the cluster
-    - Rendered region must pass _is_useless_image check (no solid fills)
-    - GAP method removed — it captures too many false positives (text separators)
-    """
     try:
         doc  = fitz.open(pdf_path)
+        # ── FIX 1 (also here): guard page_num ──
+        if page_num >= len(doc):
+            doc.close()
+            return []
         page = doc[page_num]
         crop_mat = fitz.Matrix(3.0, 3.0)
         images: list[dict] = []
@@ -364,7 +321,7 @@ def extract_vector_diagram_regions(pdf_path: str, page_num: int) -> list[dict]:
                 return
             pix = page.get_pixmap(matrix=crop_mat, clip=clip, colorspace=fitz.csRGB)
             raw = pix.tobytes("png")
-            if _is_useless_image(raw):     # skip solid-colour fills
+            if _is_useless_image(raw):
                 return
             b64 = base64.b64encode(raw).decode()
             images.append({
@@ -375,14 +332,12 @@ def extract_vector_diagram_regions(pdf_path: str, page_num: int) -> list[dict]:
             })
             captured.append(clip)
 
-        # ── DRAWINGS: cluster vector paths, keep only substantial diagram clusters ──
         drawings = page.get_drawings()
         if drawings:
             raw_rects = [fitz.Rect(d["rect"]) for d in drawings
                          if d.get("rect") and max(fitz.Rect(d["rect"]).width,
                                                    fitz.Rect(d["rect"]).height) >= 5]
 
-            # Track path count per cluster for complexity check
             clusters: list[fitz.Rect] = []
             cluster_counts: list[int] = []
             for rect in raw_rects:
@@ -405,8 +360,6 @@ def extract_vector_diagram_regions(pdf_path: str, page_num: int) -> list[dict]:
                     continue
                 if cnt < 2:
                     continue
-                # Skip formula strips: very wide + short = equation line (e.g. AC=√AB²+BC²)
-                # Real diagrams (triangle, graph, circuit) are more square-ish
                 aspect = cr.width / max(cr.height, 1)
                 if aspect > 3.0 and cr.height < 60:
                     continue
@@ -419,7 +372,6 @@ def extract_vector_diagram_regions(pdf_path: str, page_num: int) -> list[dict]:
                 )
                 _render(clip, cr.y0)
 
-        # ── ANNOTATIONS: ink drawings, hand-drawn shapes ──────────────────
         try:
             for annot in page.annots():
                 ar = fitz.Rect(annot.rect)
@@ -437,15 +389,12 @@ def extract_vector_diagram_regions(pdf_path: str, page_num: int) -> list[dict]:
 
 def extract_all_page_images(pdf_path: str, page_num: int,
                              skip_hashes: set | None = None) -> list[dict]:
-    """Return ALL images sorted TOP-TO-BOTTOM by y_pos (matches PDF reading order)."""
     raster = extract_page_embedded_images(pdf_path, page_num, skip_hashes)
     vector = extract_vector_diagram_regions(pdf_path, page_num)
-    # Deduplicate: skip vector regions that overlap with a raster image position
     deduped_vector = [v for v in vector
                       if not any(abs(v.get("y_pos", 0) - r.get("y_pos", 9999)) < 30
                                  for r in raster)]
     combined = raster + deduped_vector
-    # Sort top-to-bottom — [DIAGRAM_0] = topmost, matches Gemini's numbering in prompt
     combined.sort(key=lambda x: x.get("y_pos", 9999))
     return combined
 
@@ -455,7 +404,6 @@ def extract_all_page_images(pdf_path: str, page_num: int,
 # ================================================================
 
 def _normalize_diagram_refs(text: str) -> str:
-    """Normalize every Gemini diagram-placeholder variant → [DIAGRAM_X]."""
     if not text:
         return text
     text = re.sub(r'\bdiagram\[(\d+)\]',               r'[DIAGRAM_\1]', text, flags=re.IGNORECASE)
@@ -473,7 +421,6 @@ def _img_tag(data_uri: str, width: int = 340) -> str:
 
 
 def _cleanup_placeholders(q: dict) -> dict:
-    """Remove every leftover [DIAGRAM_X] / [DIAGRAM] string from all text fields."""
     for field in _IMG_FIELDS:
         if field in q and q[field]:
             q[field] = re.sub(r'\[DIAGRAM_?\d*\]', '', q[field])
@@ -482,24 +429,15 @@ def _cleanup_placeholders(q: dict) -> dict:
 
 
 def inject_diagrams_into_question(q: dict, page_images: list[dict]) -> dict:
-    """Replace every [DIAGRAM_X] placeholder with a base64 <img> tag.
-
-    Works for question, option1-4, and Explanation.
-    CRITICAL: Any image not referenced by a placeholder is FORCE-INJECTED so
-    canvas-drawn / vector diagrams are never silently dropped from the output.
-    """
-    # ── Step 1: normalise all variant notations in every field ──
     for field in _IMG_FIELDS:
         if field in q and q[field]:
             q[field] = _normalize_diagram_refs(q[field])
 
-    # ── Step 2: no images → clean every placeholder and exit ──
     if not page_images:
         q.pop("diagram_placements", None)
         q.pop("diagram_image_indices", None)
         return _cleanup_placeholders(q)
 
-    # ── Step 3: replace [DIAGRAM_X] with <img> tag; track which indices were used ──
     injected_indices: set[int] = set()
     for field in _IMG_FIELDS:
         if field not in q or not q[field]:
@@ -513,7 +451,6 @@ def inject_diagrams_into_question(q: dict, page_images: list[dict]) -> dict:
             else:
                 q[field] = q[field].replace(f'[DIAGRAM_{idx}]', '')
 
-    # ── Step 4: fallback — diagram_placements (position / field hints from Gemini) ──
     placements       = q.pop("diagram_placements", []) or []
     indices_fallback = q.pop("diagram_image_indices", []) or []
 
@@ -531,7 +468,6 @@ def inject_diagrams_into_question(q: dict, page_images: list[dict]) -> dict:
                 q[field] = (q.get(field) or "") + "\n" + tag
             injected_indices.add(idx)
 
-    # ── Step 5: fallback — diagram_image_indices with keyword matching ──
     q_text   = (q.get("question", "")    or "").lower()
     exp_text = (q.get("Explanation", "") or "").lower()
     for idx in indices_fallback:
@@ -544,7 +480,6 @@ def inject_diagrams_into_question(q: dict, page_images: list[dict]) -> dict:
                 q["Explanation"] = (q.get("Explanation") or "") + f"\n{tag}"
                 injected_indices.add(idx)
 
-    # ── Step 6: final cleanup — remove any leftover placeholders ──
     return _cleanup_placeholders(q)
 
 # ================================================================
@@ -562,40 +497,33 @@ def _fmt_latex(text: str) -> str:
     return text
 
 
-# ── LCM/HCF ladder line patterns ──
-_LADDER_DIVISOR_RE = re.compile(r'^\s*\d+\s*\|')      # "2 | 15  20  25"
-_LADDER_SEP_RE     = re.compile(r'^\s*\|[_\s]+$')      # "  |___________"
-_LADDER_EMPTY_DIV  = re.compile(r'^\s*\|')             # "  | 1  1  1" (empty divisor row)
-_LADDER_FINAL_RE   = re.compile(r'^\s+\d[\d\s]+$')     # "    1   1   1" (no pipe, final row)
-_LADDER_ROW_PARSE  = re.compile(r'^(\s*\d*)\s*\|\s*(.+)$')  # parse "div | nums"
+_LADDER_DIVISOR_RE = re.compile(r'^\s*\d+\s*\|')
+_LADDER_SEP_RE     = re.compile(r'^\s*\|[_\s]+$')
+_LADDER_EMPTY_DIV  = re.compile(r'^\s*\|')
+_LADDER_FINAL_RE   = re.compile(r'^\s+\d[\d\s]+$')
+_LADDER_ROW_PARSE  = re.compile(r'^(\s*\d*)\s*\|\s*(.+)$')
 
 
 def _lcm_ladder_to_html(ladder_lines: list) -> str:
-    """Convert plain-text LCM/HCF ladder → <table class="lcm-ladder-t"> with
-    border-collapse:collapse so the vertical line is perfectly continuous (zero gap).
-    Each divisor row gets border-right (vertical) + border-bottom (horizontal).
-    Final row (1,1,1) gets no borders — indented, matches PDF exactly.
-    """
-    rows       = []   # list of (divisor_str, numbers_str)
+    rows       = []
     final_nums = None
 
     for line in ladder_lines:
         stripped = line.strip()
         if _LADDER_SEP_RE.match(stripped):
-            continue                          # drop "  |___" — replaced by CSS borders
+            continue
         m = _LADDER_ROW_PARSE.match(stripped)
         if m:
             rows.append((m.group(1).strip(), m.group(2)))
         elif _LADDER_FINAL_RE.match(line):
-            final_nums = line.strip()         # "1   1   1"
+            final_nums = line.strip()
 
     if not rows:
         return ''
 
-    VL = '2px solid #111'    # vertical line (right border of divisor cell)
-    HL = '1.5px solid #111'  # horizontal line (bottom border of each row)
+    VL = '2px solid #111'
+    HL = '1.5px solid #111'
 
-    # Inline border:none resets the global "table td {border:1px solid #444}" rule
     S_D = (f'border:none;border-right:{VL};border-bottom:{HL};'
            f'text-align:right;padding:3px 6px 3px 4px;vertical-align:middle;'
            f'font-weight:bold;min-width:20px')
@@ -613,7 +541,6 @@ def _lcm_ladder_to_html(ladder_lines: list) -> str:
 
     if final_nums is not None:
         fe = final_nums.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
-        # No borders on final row — just indent to align with numbers above
         SF_D = 'border:none;padding:3px 6px 3px 4px;min-width:20px'
         SF_N = 'border:none;padding:3px 10px 3px 8px;white-space:pre;vertical-align:middle'
         tbl += f'<tr><td style="{SF_D}"></td><td style="{SF_N}">{fe}</td></tr>'
@@ -623,7 +550,6 @@ def _lcm_ladder_to_html(ladder_lines: list) -> str:
 
 
 def _md_table_to_html(text: str) -> str:
-    # Normalise <br> → \n so patterns work even after newline_to_br ran
     text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
     lines = text.split('\n')
     out, i = [], 0
@@ -631,7 +557,6 @@ def _md_table_to_html(text: str) -> str:
         line = lines[i]
         stripped = line.strip()
 
-        # ── Standard markdown table (| col | col |) ──
         if '|' in line and stripped.startswith('|') and not _LADDER_SEP_RE.match(stripped):
             table_lines = []
             while i < len(lines) and '|' in lines[i] and lines[i].strip().startswith('|'):
@@ -656,7 +581,6 @@ def _md_table_to_html(text: str) -> str:
                 out.append(html)
             continue
 
-        # ── LCM/HCF plain-text ladder: "2 | 15  20  25" (does NOT start with |) ──
         if _LADDER_DIVISOR_RE.match(stripped):
             ladder_lines = []
             while i < len(lines):
@@ -684,12 +608,9 @@ def _md_table_to_html(text: str) -> str:
 
 
 def _normalize_html_table(table_html: str) -> str:
-    """Add CSS class to Gemini-generated tables that lack one.
-    Skip lcm-ladder-t tables — they carry precise inline styles already.
-    """
     head = table_html[:120].lower()
     if 'lcm-ladder-t' in head:
-        return table_html   # already fully styled inline
+        return table_html
     if 'class=' not in head:
         return table_html.replace('<table', '<table class="ltable"', 1)
     if 'qtable' not in head and 'ltable' not in head and 'lcm-table' not in head:
@@ -708,13 +629,11 @@ _KEEP_RE = re.compile(
 def _clean_for_html(text: str) -> str:
     if not text or not isinstance(text, str):
         return ''
-    # _md_table_to_html normalises <br>→\n and detects ladder/markdown tables
     text = _md_table_to_html(text)
     segments = _KEEP_RE.split(text)
     result = []
     for seg in segments:
         if _KEEP_RE.match(seg):
-            # Normalise Gemini HTML tables that lack a CSS class
             if seg.lower().startswith('<table'):
                 seg = _normalize_html_table(seg)
             result.append(seg)
@@ -831,7 +750,6 @@ def save_checkpoint(filename, page_results, total_pages):
     checkpoint = {
         "total_pages": total_pages,
         "completed_pages": {
-            # Only save pages that have actual questions — never save empty []
             str(i): data for i, data in enumerate(page_results)
             if data is not None and len(data) > 0
         }
@@ -885,12 +803,8 @@ def convert_dollar_to_latex(text):
 
 
 def remove_base64_images(text):
-    # Do NOT strip base64 <img> tags — they are the actual diagram images.
-    # Only remove bare data-URI strings that appear outside <img> tags
-    # (e.g. raw Gemini hallucinations that were never wrapped in an img tag).
     if not text or not isinstance(text, str):
         return text
-    # Strip raw data-URI blobs that are NOT already inside an src="..." attribute
     text = re.sub(
         r'(?<!src=["\'])(?<!src=)data:image/[^;]+;base64,[A-Za-z0-9+/=]{100,}',
         '', text
@@ -899,10 +813,8 @@ def remove_base64_images(text):
 
 
 def newline_to_br(text):
-    """Replace all \\n newlines with <br> tags for HTML rendering."""
     if not text or not isinstance(text, str):
         return text
-    # Don't convert newlines inside HTML table tags
     if '<table' in text.lower():
         return text
     text = re.sub(r'<br\s*/?>', '\n', text)
@@ -1021,12 +933,10 @@ def fix_previous_year_field(py_val: str) -> str:
 
 
 # ================================================================
-# SUBTOPIC AUTO-FILL — Hindi + English keywords
+# SUBTOPIC AUTO-FILL
 # ================================================================
 
-# ── SUBTOPIC MAPS: English → Hindi ──
 _SUBTOPIC_HINDI_MAP = {
-    # Physics
     "Laws of Motion": "गति के नियम",
     "Work Energy Power": "कार्य ऊर्जा और शक्ति",
     "Gravitation": "गुरुत्वाकर्षण",
@@ -1051,7 +961,6 @@ _SUBTOPIC_HINDI_MAP = {
     "Communication Systems": "संचार व्यवस्था",
     "Ray Optics": "किरण प्रकाशिकी",
     "Wave Optics": "तरंग प्रकाशिकी",
-    # Chemistry
     "Mole Concept": "मोल संकल्पना",
     "Chemical Equilibrium": "रासायनिक साम्य",
     "Acids Bases and Salts": "अम्ल क्षार और लवण",
@@ -1068,7 +977,6 @@ _SUBTOPIC_HINDI_MAP = {
     "Coordination Compounds": "उपसहसंयोजक यौगिक",
     "Polymers": "बहुलक",
     "Biomolecules": "जैव अणु",
-    # Mathematics
     "Integration": "समाकलन",
     "Differentiation": "अवकलन",
     "Limits and Continuity": "सीमा और सातत्य",
@@ -1089,7 +997,6 @@ _SUBTOPIC_HINDI_MAP = {
     "Relations and Functions": "संबंध और फलन",
     "Inverse Trigonometry": "प्रतिलोम त्रिकोणमिति",
     "Linear Programming": "रैखिक प्रोग्रामन",
-    # Biology
     "Cell Biology": "कोशिका जीवविज्ञान",
     "Photosynthesis": "प्रकाश संश्लेषण",
     "Respiration": "श्वसन",
@@ -1109,7 +1016,6 @@ _SUBTOPIC_HINDI_MAP = {
 
 
 def _get_subtopic_in_language(subtopic_en: str, is_hindi: bool) -> str:
-    """Convert English subtopic to Hindi if is_hindi=True."""
     if not is_hindi:
         return subtopic_en
     return _SUBTOPIC_HINDI_MAP.get(subtopic_en, subtopic_en)
@@ -1125,7 +1031,6 @@ def infer_subtopic_from_question(q: dict, user_subject: str, user_chapter: str,
     chapter_lower = user_chapter.lower() if user_chapter else ""
     subject_lower = user_subject.lower() if user_subject else ""
 
-    # Physics
     if "physics" in subject_lower or "phy" in subject_lower or "भौतिक" in subject_lower:
         kw_map = [
             (["friction", "rough", "slipping", "sliding", "coefficient of friction",
@@ -1157,7 +1062,6 @@ def infer_subtopic_from_question(q: dict, user_subject: str, user_chapter: str,
             if any(kw in question_text for kw in keywords):
                 return _get_subtopic_in_language(subtopic, is_hindi)
 
-    # Chemistry
     elif "chemistry" in subject_lower or "chem" in subject_lower or "रसायन" in subject_lower:
         kw_map = [
             (["order of reaction", "rate law", "half life", "first order", "zero order",
@@ -1183,7 +1087,6 @@ def infer_subtopic_from_question(q: dict, user_subject: str, user_chapter: str,
             if any(kw in question_text for kw in keywords):
                 return _get_subtopic_in_language(subtopic, is_hindi)
 
-    # Mathematics
     elif "math" in subject_lower or "maths" in subject_lower or "गणित" in subject_lower:
         kw_map = [
             (["integrate", "integral", "∫", "समाकल", "एकीकरण"], "Integration"),
@@ -1205,7 +1108,6 @@ def infer_subtopic_from_question(q: dict, user_subject: str, user_chapter: str,
             if any(kw in question_text for kw in keywords):
                 return _get_subtopic_in_language(subtopic, is_hindi)
 
-    # Biology
     elif "biology" in subject_lower or "bio" in subject_lower or "जीव" in subject_lower:
         kw_map = [
             (["cell", "mitochondria", "nucleus", "कोशिका", "माइटोकॉन्ड्रिया", "केन्द्रक"], "Cell Biology"),
@@ -1293,7 +1195,7 @@ def text_continues_naturally(prev_text, next_text):
 
 
 # ================================================================
-# SPLIT COMBINED QUESTIONS — FIXED: don't split sub-parts
+# SPLIT COMBINED QUESTIONS
 # ================================================================
 
 _NEW_Q_AFTER_ANS_RE = re.compile(
@@ -1309,20 +1211,18 @@ _ANS_BLOCK_RE = re.compile(
     re.IGNORECASE
 )
 
-# ── Only match top-level numbered questions, NOT sub-parts ──
 _Q_NUMBER_RE = re.compile(
     r'(?:^|\n)\s*(\d+[\.\)]\s+)',
     re.MULTILINE
 )
 
-# ── FIX: Pattern to detect sub-parts — a., b., c., (i), (ii), (a), (b), 1., 2., 3. ──
 _SUBPART_RE = re.compile(
     r'(?:^|\n)\s*(?:'
-    r'[a-d][\.\)]\s+'       # a. b. c. d. or a) b) c) d)
-    r'|\([a-d]\)\s+'        # (a) (b) (c) (d)
-    r'|\([ivxIVX]+\)\s+'    # (i) (ii) (iii) (iv)
-    r'|[ivx]+[\.\)]\s+'     # i. ii. iii. iv.
-    r'|\(\d+\)\s+'          # (1) (2) (3) (4)
+    r'[a-d][\.\)]\s+'
+    r'|\([a-d]\)\s+'
+    r'|\([ivxIVX]+\)\s+'
+    r'|[ivx]+[\.\)]\s+'
+    r'|\(\d+\)\s+'
     r')',
     re.MULTILINE
 )
@@ -1335,7 +1235,6 @@ def split_combined_questions(q):
     if not _NEW_Q_AFTER_ANS_RE.search(question_text):
         return [q]
 
-    # ── FIX: If question has sub-parts (a, b, c, i, ii, 1, 2 etc.), do NOT split ──
     if _SUBPART_RE.search(question_text):
         return [q]
 
@@ -1376,7 +1275,6 @@ def split_combined_questions(q):
 
 
 def _s(val):
-    """Safe strip — handles None/non-string values."""
     return (val or "").strip() if isinstance(val, (str, type(None))) else str(val).strip()
 
 
@@ -1692,8 +1590,6 @@ _ANY_TABLE_RE = re.compile(
     re.IGNORECASE | re.DOTALL
 )
 
-# Matches solution text that sneaks into the question field:
-# "Sol.", "Ans.", "LCM =", "HCF =", "∴", "Therefore", "Hence", "उत्तर", "हल"
 _SOLUTION_SNEAK_RE = re.compile(
     r'(?:<br\s*/?>|\n|\s{2,})\s*'
     r'(?:'
@@ -1710,10 +1606,6 @@ _SOLUTION_SNEAK_RE = re.compile(
 
 
 def fix_misplaced_tables(q):
-    """Move HTML tables AND embedded solution text from 'question' field → 'Explanation'.
-    Runs after every merge/stitch operation as a safety net.
-    Skip: Match the Column (tables in question are intentional).
-    """
     q_type = q.get("question_type", "")
     if "Match" in q_type:
         return q
@@ -1725,15 +1617,12 @@ def fix_misplaced_tables(q):
     extra_parts = []
     clean_q = question_text
 
-    # ── Step 1: extract and remove <table> blocks from question ──
     if '<table' in clean_q.lower():
         tables_found = _ANY_TABLE_RE.findall(clean_q)
         if tables_found:
             clean_q = _ANY_TABLE_RE.sub('', clean_q)
             extra_parts.extend(tables_found)
 
-    # ── Step 1b: extract plain-text LCM/HCF ladder from question ──
-    # Detect "2 | 15  20  25" lines inside the question field
     _ladder_in_q = re.search(r'(?:<br>|\n|\s{2,})\s*\d+\s*\|', clean_q)
     if _ladder_in_q and _ladder_in_q.start() > 10:
         ladder_tail = clean_q[_ladder_in_q.start():]
@@ -1741,7 +1630,6 @@ def fix_misplaced_tables(q):
         if ladder_tail.strip():
             extra_parts.append(ladder_tail.strip())
 
-    # ── Step 2: split off solution text that sneaks into question ──
     sol_match = _SOLUTION_SNEAK_RE.search(clean_q)
     if sol_match and sol_match.start() > 15:
         solution_tail = clean_q[sol_match.start():].strip()
@@ -1752,11 +1640,9 @@ def fix_misplaced_tables(q):
     if not extra_parts:
         return q
 
-    # ── Step 3: clean up question text ──
     clean_q = re.sub(r'(<br\s*/?>\s*){2,}', '<br>', clean_q).strip()
     clean_q = re.sub(r'\s{2,}', ' ', clean_q).strip()
 
-    # ── Step 4: prepend rescued content to Explanation ──
     existing_exp = (q.get("Explanation", "") or "").strip()
     rescued = '\n'.join(p.strip() for p in extra_parts if p.strip())
     q["Explanation"] = (rescued + '\n' + existing_exp).strip() if existing_exp else rescued
@@ -1771,7 +1657,6 @@ def clean_question(q, page_images=None,
                    user_subject="", user_course="", user_class="",
                    user_chapter="", user_practice="", user_book="",
                    is_hindi=False):
-    """Full post-processing pipeline for a single extracted question."""
     math_fields     = ["question", "option1", "option2", "option3", "option4", "Explanation"]
     metadata_fields = ["subjectname", "chapter", "practice", "subtopic", "medium",
                        "difficulty", "question_type", "course"]
@@ -1784,10 +1669,8 @@ def clean_question(q, page_images=None,
     q["question_type"] = normalize_question_type(q.get("question_type") or "MCQs")
     q["question_bucket"] = normalize_question_bucket(q.get("question_bucket") or "")
 
-    # ── FIX 1: medium must ALWAYS come from is_hindi toggle, not hardcoded ──
     q["medium"] = "Hindi" if is_hindi else "English"
 
-    # ── FIX: Extract previous_year from question text ──
     existing_py = fix_previous_year_field(_s(q.get("previous_year")))
     if not existing_py:
         q_text = _s(q.get("question"))
@@ -1815,7 +1698,6 @@ def clean_question(q, page_images=None,
 
     if "Explanation" in q:
         q["Explanation"] = clean_explanation_prefix(q["Explanation"])
-        # Strip stray inline HTML tags (e.g. <b>, <i>, <u>) but keep <img> and <table>
         if q["Explanation"] and isinstance(q["Explanation"], str):
             q["Explanation"] = re.sub(
                 r'<(?!img\b|/img\b|table\b|/table\b|tr\b|/tr\b|td\b|/td\b|th\b|/th\b|br\b|div\b|/div\b)[^>]+>',
@@ -1841,8 +1723,6 @@ def clean_question(q, page_images=None,
 
     q = enforce_question_type_rules(q)
 
-    # CRITICAL: inject diagrams FIRST — before any further text processing
-    # that could accidentally strip the injected <img> tags
     q = inject_diagrams_into_question(q, page_images or [])
 
     if user_subject:  q["subjectname"] = user_subject
@@ -1852,19 +1732,15 @@ def clean_question(q, page_images=None,
     q["practice"] = user_practice if user_practice else q.get("practice", "")
     if user_book:     q["book"]        = user_book
 
-    # ── FIX 1 (again, final override): medium is always from toggle ──
     q["medium"] = "Hindi" if is_hindi else "English"
 
-    # ── FIX: Pass is_hindi to subtopic inference ──
     if not _s(q.get("subtopic")):
         inferred = infer_subtopic_from_question(q, user_subject, user_chapter, is_hindi=is_hindi)
         if inferred:
             q["subtopic"] = inferred
 
-    # ── Move any misplaced LCM/data tables out of question into Explanation ──
     q = fix_misplaced_tables(q)
 
-    # ── FIX 3: newline_to_br skips table content ──
     br_fields = ["question", "option1", "option2", "option3", "option4", "Explanation"]
     for field in br_fields:
         if field in q:
@@ -1940,7 +1816,6 @@ def clean_json_response(text):
             return None
 
     def _only_dicts(lst):
-        """Keep only dict items — drops stray strings/numbers in parsed list."""
         if not isinstance(lst, list):
             return None
         dicts = [x for x in lst if isinstance(x, dict)]
@@ -2032,12 +1907,17 @@ def stitch_split_questions_enhanced(page_results):
             page_results[page_idx] = page
 
         for page_idx in range(num_pages - 1):
+            # ── FIX 2: guard empty page list before accessing [-1] or [0] ──
             if not page_results[page_idx]:
                 continue
             next_idx = page_idx + 1
             while next_idx < num_pages and not page_results[next_idx]:
                 next_idx += 1
             if next_idx >= num_pages:
+                continue
+
+            # ── FIX 2: double-check both lists are non-empty ──
+            if not page_results[page_idx] or not page_results[next_idx]:
                 continue
 
             last_q  = page_results[page_idx][-1]
@@ -2112,7 +1992,6 @@ def extract_continuation_fragment(pdf_path, page_index, prev_last_q, api_key, mo
             if is_hindi else ""
         )
 
-        # ── FIX 1: use variable, never hardcode ──
         medium_val = "Hindi" if is_hindi else "English"
 
         prompt = f"""
@@ -2230,6 +2109,7 @@ def recover_missing_answers(pdf_path, page_results, api_key, model_name,
     targets = []
     for page_idx in range(num_pages):
         page = page_results[page_idx]
+        # ── FIX 2: also guard empty list here ──
         if not page or not _question_needs_answer(page[-1]):
             continue
         candidates = []
@@ -2248,6 +2128,9 @@ def recover_missing_answers(pdf_path, page_results, api_key, model_name,
     )
 
     for page_idx, candidate_pages in targets:
+        # ── FIX 2: guard again before accessing [-1] ──
+        if not page_results[page_idx]:
+            continue
         current_q = page_results[page_idx][-1]
         found = False
 
@@ -2342,22 +2225,14 @@ def fix_exam_field(all_questions):
 # DEDUPLICATE DIAGRAM PLACEMENTS
 # ================================================================
 def deduplicate_diagram_placements(questions: list) -> list:
-    """
-    If the model placed the same [DIAGRAM_X] in multiple questions,
-    keep it only in the ONE question where it makes most sense
-    (strongest visual keyword match, or earliest position).
-    Remove it from all other questions.
-    """
     if not questions:
         return questions
 
-    # Normalise first
     for q in questions:
         for field in _IMG_FIELDS:
             if field in q and q[field]:
                 q[field] = _normalize_diagram_refs(q[field])
 
-    # Find all (diagram_idx → list of question_indices that contain it)
     diagram_to_qs: dict[int, list[int]] = {}
     for qi, q in enumerate(questions):
         for field in _IMG_FIELDS:
@@ -2376,11 +2251,10 @@ def deduplicate_diagram_placements(questions: list) -> list:
 
     for idx, qi_list in diagram_to_qs.items():
         if len(qi_list) <= 1:
-            continue  # already unique, nothing to do
+            continue
 
         tag = f'[DIAGRAM_{idx}]'
 
-        # Score each candidate question by keyword presence
         def _score(qi):
             q = questions[qi]
             combined = " ".join([
@@ -2391,7 +2265,6 @@ def deduplicate_diagram_placements(questions: list) -> list:
 
         best_qi = max(qi_list, key=_score)
 
-        # Remove the tag from all questions except the best one
         for qi in qi_list:
             if qi == best_qi:
                 continue
@@ -2407,22 +2280,14 @@ def deduplicate_diagram_placements(questions: list) -> list:
 # AUTO-INJECT MISSED DIAGRAMS
 # ================================================================
 def auto_inject_missed_diagrams(questions, page_images):
-    """
-    CONSERVATIVE: Only inject [DIAGRAM_X] when the question text EXPLICITLY
-    mentions a visual element (figure, diagram, refer, graph, circuit, etc.).
-    NEVER force-inject into questions that have no visual reference — that
-    causes wrong images to appear in text-only questions.
-    """
     if not questions or not page_images:
         return questions
 
-    # Normalise variant refs first
     for q in questions:
         for field in _IMG_FIELDS:
             if field in q and q[field]:
                 q[field] = _normalize_diagram_refs(q[field])
 
-    # Find already-placed indices
     placed: set[int] = set()
     for q in questions:
         for field in _IMG_FIELDS:
@@ -2433,7 +2298,6 @@ def auto_inject_missed_diagrams(questions, page_images):
     if not missing:
         return questions
 
-    # Strong visual keywords — only inject if one of these is in the question
     _STRONG_KWS = [
         'figure', 'fig.', 'fig ', 'diagram', 'refer', 'shown', 'given below',
         'given above', 'graph', 'circuit', 'image', 'picture', 'illustration',
@@ -2448,19 +2312,17 @@ def auto_inject_missed_diagrams(questions, page_images):
             q_text = (q.get("question", "") or "").lower()
             exp_text = (q.get("Explanation", "") or "").lower()
             combined = q_text + " " + exp_text
-            # Only inject if there's a clear visual keyword AND no diagram yet in this q
             if any(kw in combined for kw in _STRONG_KWS):
                 already_has = any('[DIAGRAM_' in (q.get(f, "") or "") for f in _IMG_FIELDS)
                 if not already_has:
                     q["question"] = (q.get("question", "") or "") + f"\n{tag}"
                     break
-        # If no keyword match found → do NOT inject anywhere (trust model's judgment)
 
     return questions
 
 
 # ================================================================
-# ENHANCED GEMINI PAGE PROCESSOR — HINDI AWARE + ALL FIXES
+# ENHANCED GEMINI PAGE PROCESSOR
 # ================================================================
 def process_single_page(args):
     (pdf_path, page_index, page_num, api_key, model_name,
@@ -2521,10 +2383,8 @@ SECTION MARKS: ALL questions on this page carry {section_marks_hint} mark(s).
         practice_ctx = f'Practice/Exercise: "{user_practice}"' if user_practice else ""
         context_block = " | ".join(filter(None, [subject_ctx, chapter_ctx, practice_ctx]))
 
-        # ── FIX 1: medium_val from is_hindi toggle — NEVER hardcode ──
         medium_val = "Hindi" if is_hindi else "English"
 
-        # ── LANGUAGE BLOCK ──
         if is_hindi:
             language_block = """
 ══════════════════════════════════════════════
@@ -2546,7 +2406,6 @@ MANDATORY RULES:
         else:
             language_block = ""
 
-        # ── SUBTOPIC LANGUAGE INSTRUCTION ──
         if is_hindi:
             subtopic_lang_rule = (
                 '"subtopic" must be in HINDI. Examples: "अभिक्रिया की कोटि", "गति के नियम", '
@@ -2562,7 +2421,6 @@ MANDATORY RULES:
                 '  • NEVER write subtopic in Hindi when medium is English.'
             )
 
-        # ── FIX 2: Sub-parts rule (a,b,c / i,ii,iii / 1,2,3) ──
         subpart_rule = """
 ══════════════════════════════════════════════
 RULE 1B — SUB-PARTS MUST STAY TOGETHER (CRITICAL — READ CAREFULLY)
@@ -2587,7 +2445,6 @@ EXAMPLES of what NOT to do:
 The Explanation field must contain answers/solutions for ALL sub-parts together.
 """
 
-        # ── Table / Ladder rules ──
         _TH  = 'style="border:1px solid #333;padding:5px 10px;background:#dbeafe;font-weight:bold;text-align:center;vertical-align:middle"'
         _TD  = 'style="border:1px solid #333;padding:5px 10px;text-align:center;vertical-align:middle"'
         _TD_L = 'style="border:1px solid #333;padding:5px 10px;text-align:left;vertical-align:middle"'
@@ -3036,7 +2893,6 @@ if "extraction_rendered_pages" not in st.session_state:
 st.markdown("""<style>
 .block-container{padding-top:0.6rem!important;padding-bottom:0!important;max-width:100%!important}
 header{visibility:hidden}
-/* ── Full-screen live panel ── */
 body.live-fs [data-testid="stSidebar"]{display:none!important}
 body.live-fs header{display:none!important}
 body.live-fs .block-container{padding:0.3rem 0.6rem!important;max-width:100%!important}
@@ -3129,7 +2985,6 @@ if use_sections:
 
 st.markdown("---")
 
-# ── Quick API Test ──────────────────────────────────────────────────
 _tc1, _tc2 = st.columns([1, 4])
 with _tc1:
     if st.button("🔌 Test API"):
@@ -3156,8 +3011,6 @@ with _tc1:
                     st.error(f"❌ API FAILED: {str(_e)}")
 
 st.markdown("---")
-
-# ── Test Single Page ────────────────────────────────────────────────
 _tp1, _tp2 = st.columns([1, 4])
 with _tp1:
     if st.button("🧪 Test Page 1", help="Extract page 1 only and show raw response"):
@@ -3213,6 +3066,8 @@ if st.button("Start / Resume Extraction 🚀", type="primary"):
             st.stop()
 
     try:
+        import traceback as _tb
+
         with st.status("Phase 1: Loading PDF...") as status:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
                 tmp_file.write(uploaded_file.read())
@@ -3255,7 +3110,6 @@ if st.button("Start / Resume Extraction 🚀", type="primary"):
             for i in pending_indices
         ]
 
-        # ── Fullscreen toggle button ──────────────────────────────
         components.html("""
 <style>
 #fsb{cursor:pointer;border:1.5px solid #6366f1;border-radius:7px;
@@ -3274,7 +3128,6 @@ function toggleFS(){
 <button id="fsb" onclick="toggleFS()">&#x26F6; Full Screen</button>
 """, height=52)
 
-        # ── 3-column live panel: PDF | Preview | JSON ────────────
         live_col_pdf, live_col_preview, live_col_json = st.columns([1, 1, 1])
         with live_col_pdf:
             st.markdown("**📄 Complete PDF** *(page-by-page as processed)*")
@@ -3297,7 +3150,6 @@ function toggleFS(){
         _page_q_counts: dict  = {}
         live_qs: list         = []
 
-        # Pre-render all PDF pages so the PDF panel is fully visible immediately
         status_text.text("Loading PDF pages…")
         for _pi in range(total_pages):
             try:
@@ -3305,7 +3157,6 @@ function toggleFS(){
             except Exception:
                 pass
 
-        # Mark already-done checkpoint pages
         for _pi in range(total_pages):
             if page_results[_pi] is not None:
                 _done_pages.add(_pi)
@@ -3352,7 +3203,12 @@ function toggleFS(){
                 }
                 for future in concurrent.futures.as_completed(future_to_index):
                     idx = future_to_index[future]
-                    result = future.result()
+                    # ── FIX 3: wrap each future result in try/except ──
+                    try:
+                        result = future.result()
+                    except Exception as _fe:
+                        print(f"⚠️ Page {idx+1} future exception: {_fe}")
+                        result = []
                     page_results[idx] = result if result else []
                     _done_pages.add(idx)
                     _page_q_counts[idx] = sum(
@@ -3400,7 +3256,6 @@ function toggleFS(){
                     all_questions.append(q)
 
         if all_questions:
-            # Final safety pass: move any tables/solution text still in question → Explanation
             all_questions = [fix_misplaced_tables(q) for q in all_questions]
             raw_count = len(all_questions)
             all_questions, duplicates_removed = final_cleanup(all_questions)
@@ -3423,7 +3278,6 @@ function toggleFS(){
 
             for idx, q in enumerate(all_questions):
                 q["questionid"] = idx + 1
-                # ── FIX 1: Final override — medium always from toggle ──
                 q["medium"] = "Hindi" if is_hindi else "English"
 
             all_questions = [apply_field_order(q) for q in all_questions]
@@ -3529,7 +3383,6 @@ function toggleFS(){
             st.info("💡 Sidebar → Checkpoint Manager → Delete All Checkpoints → then re-extract.")
             with st.expander("🔍 Debug — Page 1 API test", expanded=True):
                 try:
-                    # Re-save the uploaded file since temp_pdf_path may be deleted
                     import tempfile as _tf2
                     with _tf2.NamedTemporaryFile(delete=False, suffix=".pdf") as _tmp2:
                         uploaded_file.seek(0)
@@ -3561,12 +3414,17 @@ function toggleFS(){
                 st.rerun()
 
     except Exception as global_error:
+        # ── FIX 4: show full traceback so exact line is visible in logs ──
+        import traceback as _tb
+        _tb_str = _tb.format_exc()
+        print(_tb_str)
         st.error(f"Fatal Error: {str(global_error)}")
+        st.code(_tb_str, language="python")
         st.warning("Progress has been saved. Click 'Start / Resume' to continue.")
 
 
 # ================================================================
-# PERSISTENT RESULT PANELS  (survive download / any button click)
+# PERSISTENT RESULT PANELS
 # ================================================================
 _pr_qs    = st.session_state.get("extraction_all_questions")
 _pr_json  = st.session_state.get("extraction_result")
